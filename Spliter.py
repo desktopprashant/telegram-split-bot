@@ -34,6 +34,10 @@ bot = telebot.TeleBot(BOT_TOKEN)
 # User session storage (In-memory)
 user_sessions = {}
 
+# File batching lock and queue (Auto-detect jab user multiple files ek sath bhejta hai)
+batch_lock = threading.Lock()
+pending_file_batches = {}
+
 def get_session(chat_id):
     if chat_id not in user_sessions:
         user_sessions[chat_id] = {
@@ -119,7 +123,8 @@ def send_welcome(message):
         "1️⃣ <b>✂️ Extract Numbers (Mono):</b> Faltu text hata kar sirf unique phone numbers nikalta hai (Tap to Copy).\n"
         "2️⃣ <b>🔐 Number:Password + TXT:</b> Sabhi unique numbers ke sath password jodh kar 📄 <b>.txt file</b> banata hai.\n"
         "3️⃣ <b>📂 Combine TXT Files:</b> Multiple .txt files ko ek sath jod kar single combined file banata hai (Duplicates auto-removed!).\n"
-        "4️⃣ <b>🛡️ Auto-Duplicate Filter:</b> Koi bhi duplicate number repeat nahi hoga!\n\n"
+        "4️⃣ <b>⚡ Auto-Combine:</b> Agar aap 2 ya zyada .txt files ek sath bhejenge, bot unhe automatically merge kar dega!\n"
+        "5️⃣ <b>🛡️ Auto-Duplicate Filter:</b> Koi bhi duplicate number repeat nahi hoga!\n\n"
         f"⚙️ <b>Current Status:</b>\n"
         f"• Active Mode: <b>{session['mode'].upper()}</b>\n"
         f"• Current Password: <code>{html.escape(curr_pass)}</code>\n\n"
@@ -134,11 +139,11 @@ def send_help(message):
     help_text = (
         "📖 <b>Bot Guide & Options:</b>\n\n"
         "🔹 <b>✂️ Extract Numbers (Mono)</b>\n"
-        "Text bhejiye, bot usme se duplicate hata kar sirf unique numbers alag message me tap-to-copy dega.\n\n"
+        "Text bhejiye, bot duplicate hata kar sirf unique numbers tap-to-copy mono me dega.\n\n"
         "🔹 <b>🔐 Number:Password + TXT</b>\n"
-        "Numbers bhejiye, bot format karega: <code>number:{pwd}</code> aur uski <b>.txt file</b> send karega.\n\n"
+        "Numbers bhejiye, bot format karega: <code>number:{pwd}</code> aur <b>.txt file</b> send karega.\n\n"
         "🔹 <b>📂 Combine TXT Files</b>\n"
-        "Is option se aap multiple .txt files bhej sakte hain. Bot sabhi files ke numbers jod kar ek master file bana dega.\n\n"
+        "Aap 2 ya usse zyada .txt files ek sath bhej sakte hain. Bot un sabhi ke numbers combine karke single master file dega.\n\n"
         "🔹 <b>🔑 Set Password</b>\n"
         "Apna password badalne ke liye button dabayein ya <code>/setpassword MyPass123</code> type karein.\n\n"
         "🔹 <b>Commands:</b>\n"
@@ -202,7 +207,7 @@ def set_combine_mode(message):
         reply_markup=get_combine_keyboard()
     )
 
-# 6. Merge & Download Trigger
+# 6. Merge & Download Trigger (Manual combine mode)
 @bot.message_handler(func=lambda msg: msg.text == "✅ Merge & Download TXT")
 def trigger_merge(message):
     session = get_session(message.chat.id)
@@ -223,7 +228,6 @@ def trigger_merge(message):
     total_unique = len(unique_nums)
     total_dups = len(dups)
     
-    # Inline buttons for format selection
     markup = types.InlineKeyboardMarkup()
     btn1 = types.InlineKeyboardButton("📄 Plain Unique Numbers (.txt)", callback_data="merge_plain")
     btn2 = types.InlineKeyboardButton(f"🔐 With Password ({session['password']})", callback_data="merge_combo")
@@ -283,7 +287,6 @@ def handle_merge_callback(call):
         parse_mode='HTML'
     )
     
-    # Reset combine buffer after successful merge
     session["combine_buffer"] = []
     session["combine_files"] = []
     session["mode"] = "extract"
@@ -350,7 +353,79 @@ def cancel_action(message):
 def help_button_handler(message):
     send_help(message)
 
-# 11. Document Handler (Agar user .txt file upload kare)
+# 11. Document Batch Processing Function (Auto Combine Handler)
+def handle_document_batch(chat_id):
+    with batch_lock:
+        batch_data = pending_file_batches.pop(chat_id, None)
+    if not batch_data:
+        return
+        
+    files = batch_data["files"]  # List of (file_name, file_text)
+    last_message = batch_data["message"]
+    session = get_session(chat_id)
+    
+    # CASE A: Agar sirf 1 file aayi hai
+    if len(files) == 1:
+        fname, ftext = files[0]
+        process_text_input(last_message, ftext, source_name=fname)
+        return
+        
+    # CASE B: Agar 2 ya zyada files ek sath aayi hain -> AUTO COMBINE!
+    all_numbers = []
+    file_details = []
+    
+    for fname, ftext in files:
+        fnums = extract_phone_numbers(ftext)
+        all_numbers.extend(fnums)
+        file_details.append(f"• <code>{html.escape(fname)}</code> ({len(fnums)} numbers)")
+        
+    unique_nums, dups = deduplicate_numbers(all_numbers)
+    total_raw = len(all_numbers)
+    total_unique = len(unique_nums)
+    total_dups = len(dups)
+    
+    if not unique_nums:
+        bot.reply_to(last_message, "⚠️ In files me koi valid phone number nahi mila.")
+        return
+        
+    summary_msg = (
+        f"📂 <b>{len(files)} Files Auto-Combined!</b>\n\n"
+        f"<b>Received Files:</b>\n" + "\n".join(file_details) + "\n\n"
+        f"🔢 <b>Total Numbers:</b> {total_raw}\n"
+        f"✅ <b>Unique Numbers:</b> {total_unique}\n"
+        f"🗑️ <b>Duplicates Filtered:</b> {total_dups}\n\n"
+        f"<i>Combined file niche ready hai:</i>"
+    )
+    bot.send_message(chat_id, summary_msg, parse_mode='HTML')
+    
+    curr_pass = session["password"]
+    
+    # Active mode ke hisab se format karna
+    if session["mode"] == "password":
+        formatted_lines = [f"{num}:{curr_pass}" for num in unique_nums]
+        content = "\n".join(formatted_lines)
+        fname = f"combined_{curr_pass}_{total_unique}.txt"
+        caption = (
+            f"📄 <b>Combined Password File Ready!</b>\n\n"
+            f"📊 Unique Numbers: <code>{total_unique}</code>\n"
+            f"🔑 Password: <code>{html.escape(curr_pass)}</code>\n"
+            f"🗑️ Duplicates Filtered: <code>{total_dups}</code>"
+        )
+    else:
+        content = "\n".join(unique_nums)
+        fname = f"combined_unique_{total_unique}.txt"
+        caption = (
+            f"📄 <b>Combined Plain Unique Numbers!</b>\n\n"
+            f"📊 Unique Numbers: <code>{total_unique}</code>\n"
+            f"🗑️ Duplicates Filtered: <code>{total_dups}</code>"
+        )
+        
+    txt_stream = io.BytesIO(content.encode('utf-8'))
+    txt_stream.name = fname
+    bot.send_document(chat_id, txt_stream, caption=caption, parse_mode='HTML')
+    print(f"Chat {chat_id}: Auto-combined {len(files)} files -> {total_unique} unique numbers.")
+
+# 12. Document Handler (TXT files receive karna)
 @bot.message_handler(content_types=['document'])
 def handle_document(message):
     if not message.document.file_name.lower().endswith('.txt'):
@@ -361,43 +436,56 @@ def handle_document(message):
         file_info = bot.get_file(message.document.file_id)
         downloaded_file = bot.download_file(file_info.file_path)
         file_text = downloaded_file.decode('utf-8', errors='ignore')
-        
-        session = get_session(message.chat.id)
-        
-        # Agar Combine Mode me file aayi hai
-        if session.get("mode") == "combine":
-            file_nums = extract_phone_numbers(file_text)
-            if not file_nums:
-                bot.reply_to(message, f"⚠️ <code>{html.escape(message.document.file_name)}</code> me koi phone number nahi mila.", parse_mode='HTML')
-                return
-                
-            session["combine_buffer"].extend(file_nums)
-            session["combine_files"].append(message.document.file_name)
-            
-            bot.reply_to(
-                message,
-                f"📥 <b>File #{len(session['combine_files'])} Added:</b> <code>{html.escape(message.document.file_name)}</code>\n"
-                f"• Is file me numbers: <b>{len(file_nums)}</b>\n"
-                f"• Ab tak total numbers: <b>{len(session['combine_buffer'])}</b>\n\n"
-                f"<i>Aur .txt files bhejiye ya niche '✅ Merge & Download TXT' button dabayein!</i>",
-                parse_mode='HTML',
-                reply_markup=get_combine_keyboard()
-            )
-            return
-
-        # Normal single file processing
-        process_text_input(message, file_text)
-        
     except Exception as e:
-        bot.reply_to(message, f"❌ File read karne me error: {str(e)}")
+        bot.reply_to(message, f"❌ File download error: {str(e)}")
+        return
 
-# 12. Normal Text Message Handler
+    session = get_session(message.chat.id)
+    
+    # 1. Agar user ne specifically '📂 Combine TXT Files' button dabaya tha
+    if session.get("mode") == "combine":
+        file_nums = extract_phone_numbers(file_text)
+        if not file_nums:
+            bot.reply_to(message, f"⚠️ <code>{html.escape(message.document.file_name)}</code> me koi phone number nahi mila.", parse_mode='HTML')
+            return
+            
+        session["combine_buffer"].extend(file_nums)
+        session["combine_files"].append(message.document.file_name)
+        
+        bot.reply_to(
+            message,
+            f"📥 <b>File #{len(session['combine_files'])} Added:</b> <code>{html.escape(message.document.file_name)}</code>\n"
+            f"• Is file me numbers: <b>{len(file_nums)}</b>\n"
+            f"• Ab tak total numbers: <b>{len(session['combine_buffer'])}</b>\n\n"
+            f"<i>Aur .txt files bhejiye ya niche '✅ Merge & Download TXT' button dabayein!</i>",
+            parse_mode='HTML',
+            reply_markup=get_combine_keyboard()
+        )
+        return
+
+    # 2. Agar normal mode me 2 ya usse zyada files ek sath aayi hain (Debounce 2.0 sec)
+    with batch_lock:
+        if message.chat.id in pending_file_batches:
+            pending_file_batches[message.chat.id]["files"].append((message.document.file_name, file_text))
+            pending_file_batches[message.chat.id]["message"] = message
+            pending_file_batches[message.chat.id]["timer"].cancel()
+        else:
+            pending_file_batches[message.chat.id] = {
+                "message": message,
+                "files": [(message.document.file_name, file_text)],
+                "timer": None
+            }
+            
+        t = threading.Timer(2.0, handle_document_batch, args=[message.chat.id])
+        pending_file_batches[message.chat.id]["timer"] = t
+        t.start()
+
+# 13. Normal Text Message Handler
 @bot.message_handler(func=lambda message: True)
 def handle_text_message(message):
     session = get_session(message.chat.id)
     user_text = message.text.strip()
     
-    # Agar user password enter kar raha hai
     if session.get("awaiting") == "new_password":
         session["password"] = user_text
         session["awaiting"] = None
@@ -413,8 +501,8 @@ def handle_text_message(message):
         
     process_text_input(message, user_text)
 
-# Core processing function (with auto-deduplication)
-def process_text_input(message, input_text):
+# Core processing function (Single text / single file)
+def process_text_input(message, input_text, source_name=None):
     session = get_session(message.chat.id)
     raw_numbers = extract_phone_numbers(input_text)
     
@@ -427,29 +515,27 @@ def process_text_input(message, input_text):
         )
         return
         
-    # Deduplication
     unique_numbers, duplicates = deduplicate_numbers(raw_numbers)
     total_raw = len(raw_numbers)
     total_unique = len(unique_numbers)
     total_dups = len(duplicates)
     
     dup_info = f" <i>(🗑️ {total_dups} duplicate{'s' if total_dups > 1 else ''} removed)</i>" if total_dups > 0 else ""
+    src_info = f" from <code>{html.escape(source_name)}</code>" if source_name else ""
 
-    # MODE 1: Extract Numbers (Mono tap to copy)
+    # MODE 1: Extract Numbers
     if session["mode"] == "extract":
         bot.send_message(
             message.chat.id,
-            f"✂️ <b>Extracted {total_unique} Unique Number{'s' if total_unique > 1 else ''}:</b>{dup_info}\n<i>(Tap on number to copy)</i>",
+            f"✂️ <b>Extracted {total_unique} Unique Number{'s' if total_unique > 1 else ''}{src_info}:</b>{dup_info}\n<i>(Tap on number to copy)</i>",
             parse_mode='HTML'
         )
         
-        # Agar numbers 15 ya kam hain, to direct mono messages bhejo
         if total_unique <= 15:
             for num in unique_numbers:
                 bot.send_message(message.chat.id, f"<code>{html.escape(num)}</code>", parse_mode='HTML')
                 time.sleep(0.3)
         else:
-            # Agar bohot saare numbers hain, to pehle 10 preview bhejo aur sath me .txt file
             preview = "\n".join([f"<code>{html.escape(n)}</code>" for n in unique_numbers[:10]])
             bot.send_message(
                 message.chat.id,
@@ -465,27 +551,25 @@ def process_text_input(message, input_text):
                 parse_mode='HTML'
             )
             
-        print(f"Chat {message.chat.id}: Processed {total_unique} unique numbers ({total_dups} duplicates removed).")
+        print(f"Chat {message.chat.id}: Processed {total_unique} unique numbers ({total_dups} dups removed).")
 
-    # MODE 2: Number:Password + TXT Generation
+    # MODE 2: Number:Password + TXT
     elif session["mode"] == "password":
         curr_pass = session["password"]
         formatted_lines = [f"{num}:{curr_pass}" for num in unique_numbers]
         full_content = "\n".join(formatted_lines)
         
-        # Preview send karna
         preview_limit = 15
         preview_text = "\n".join(formatted_lines[:preview_limit])
         extra_note = f"\n<i>...aur {total_unique - preview_limit} numbers niche file me hain.</i>" if total_unique > preview_limit else ""
         
         preview_msg = (
-            f"🔐 <b>Formatted {total_unique} Unique Number{'s' if total_unique > 1 else ''}:</b>{dup_info}\n\n"
+            f"🔐 <b>Formatted {total_unique} Unique Number{'s' if total_unique > 1 else ''}{src_info}:</b>{dup_info}\n\n"
             f"<pre>{html.escape(preview_text)}</pre>"
             f"{extra_note}"
         )
         bot.send_message(message.chat.id, preview_msg, parse_mode='HTML')
         
-        # TXT file generate karke send karna
         txt_stream = io.BytesIO(full_content.encode('utf-8'))
         txt_stream.name = f"numbers_{curr_pass}_{total_unique}.txt"
         
@@ -502,7 +586,7 @@ def process_text_input(message, input_text):
         )
         print(f"Chat {message.chat.id}: Generated TXT file for {total_unique} unique numbers ({total_dups} dups removed).")
 
-print("Bot active hai... Numbers Extractor, Duplicate Remover & File Combiner ready.")
+print("Bot active hai... Numbers Extractor, Duplicate Remover, Auto-Combiner ready.")
 
 # Bot Polling
 bot.infinity_polling()
