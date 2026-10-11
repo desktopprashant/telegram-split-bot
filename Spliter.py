@@ -523,35 +523,32 @@ def process_text_input(message, input_text, source_name=None):
     dup_info = f" <i>(🗑️ {total_dups} duplicate{'s' if total_dups > 1 else ''} removed)</i>" if total_dups > 0 else ""
     src_info = f" from <code>{html.escape(source_name)}</code>" if source_name else ""
 
-    # MODE 1: Extract Numbers
+    # MODE 1: Extract Numbers (Har ek number one-by-one alag message me)
     if session["mode"] == "extract":
         bot.send_message(
             message.chat.id,
-            f"✂️ <b>Extracted {total_unique} Unique Number{'s' if total_unique > 1 else ''}{src_info}:</b>{dup_info}\n<i>(Tap on number to copy)</i>",
+            f"✂️ <b>Sending {total_unique} Unique Number{'s' if total_unique > 1 else ''}{src_info} one-by-one:</b>{dup_info}\n<i>(Tap on any number to copy)</i>",
             parse_mode='HTML'
         )
         
-        if total_unique <= 15:
-            for num in unique_numbers:
+        for num in unique_numbers:
+            try:
                 bot.send_message(message.chat.id, f"<code>{html.escape(num)}</code>", parse_mode='HTML')
-                time.sleep(0.3)
-        else:
-            preview = "\n".join([f"<code>{html.escape(n)}</code>" for n in unique_numbers[:10]])
-            bot.send_message(
-                message.chat.id,
-                f"<b>Preview (First 10):</b>\n{preview}\n\n<i>Baki sabhi {total_unique} numbers ki file niche hai:</i>",
-                parse_mode='HTML'
-            )
-            txt_stream = io.BytesIO("\n".join(unique_numbers).encode('utf-8'))
-            txt_stream.name = f"unique_numbers_{total_unique}.txt"
-            bot.send_document(
-                message.chat.id,
-                txt_stream,
-                caption=f"📄 <b>Total Unique Numbers:</b> <code>{total_unique}</code>{dup_info}",
-                parse_mode='HTML'
-            )
-            
-        print(f"Chat {message.chat.id}: Processed {total_unique} unique numbers ({total_dups} dups removed).")
+                time.sleep(0.35)
+            except telebot.apihelper.ApiTelegramException as e:
+                if e.error_code == 429:
+                    retry_after = e.result_json.get('parameters', {}).get('retry_after', 5)
+                    time.sleep(retry_after + 1)
+                    bot.send_message(message.chat.id, f"<code>{html.escape(num)}</code>", parse_mode='HTML')
+                else:
+                    print(f"Telegram API error: {e}")
+                    
+        bot.send_message(
+            message.chat.id,
+            f"✅ <b>Done! Total {total_unique} unique numbers sent.</b>{dup_info}",
+            parse_mode='HTML'
+        )
+        print(f"Chat {message.chat.id}: Sent {total_unique} unique numbers one-by-one ({total_dups} dups removed).")
 
     # MODE 2: Number:Password + TXT
     elif session["mode"] == "password":
