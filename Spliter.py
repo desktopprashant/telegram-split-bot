@@ -80,7 +80,7 @@ def get_combine_keyboard():
     markup.add(btn_merge, btn_cancel)
     return markup
 
-# Function to extract phone numbers from mixed text
+# Function to extract phone numbers from mixed text (Exact As-Is, no digit trimming)
 def extract_phone_numbers(text):
     extracted = []
     for line in text.splitlines():
@@ -88,23 +88,18 @@ def extract_phone_numbers(text):
         if not line:
             continue
         
-        # 1. Indian numbers 10-digits (starting with 6-9), optionally with +91 or 91
-        m1 = re.findall(r'(?:(?:\+|0{0,2})91[\s-]?)?([6-9]\d{9})(?!\d)', line)
-        if m1:
-            extracted.extend(m1)
+        # Summary / Header lines ko ignore karna jisme account numbers nahi hote
+        if any(h in line.upper() for h in ['TOTAL AVAILABLE', 'PENDING ORDERS', 'WITHDRAWN AMOUNT', 'ACTIVE ACCOUNTS', 'ACCOUNTS SKIPPED']):
             continue
             
-        # 2. Any 10-digit number sequence
-        m2 = re.findall(r'\b\d{10}\b', line)
-        if m2:
-            extracted.extend(m2)
-            continue
-
-        # 3. Any 8 to 12 digits chunk (e.g. 894833840amanp)
-        m3 = re.findall(r'\d{8,12}', line)
-        if m3:
-            extracted.extend(m3)
-            continue
+        # Jitne bhi digits ka number ho (6 se 18 digits), exact as-it-is extract karna (kisi bhi digit ko cut ya trim nahi karna)
+        matches = re.findall(r'\b\d{6,18}\b', line)
+        if not matches:
+            # Fallback agar text ke sath chipka ho (e.g. 894833840amanp ya ID:68816017370)
+            matches = re.findall(r'\d{6,18}', line)
+            
+        if matches:
+            extracted.extend(matches)
             
     return extracted
 
